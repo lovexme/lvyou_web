@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Board LAN Hub - v3.0 (Full+LoginPage+BasicAuth+DualStack) UI+API (single port 8000)
+# Board LAN Hub - v3.0 (安全优化版)
 # 修改版：带别名/分组/自然排序/批量转发/批量WiFi/单个&批量卡号/详情弹窗 UI
+# 优化：安全卸载、错误处理、密码安全、服务健康检查
 set -euo pipefail
 
 RED='\u001B[0;31m'
@@ -28,12 +29,46 @@ CIDR=""
 
 SERVICEAPI4="/etc/systemd/system/board-manager-v4.service"
 SERVICEAPI6="/etc/systemd/system/board-manager-v6.service"
+CONFIG_FILE="/etc/board-manager.conf"
+BACKUP_DIR="/var/backups/board-manager"
 
 need_root(){
   if [[ $EUID -ne 0 ]]; then
     log_err "需要root权限，请使用 sudo 运行"
     exit 1
   fi
+}
+
+safe_delete(){
+  local target="$1"
+  local safe_dirs=("/" "/bin" "/sbin" "/usr" "/etc" "/lib" "/lib64" "/var" "/home" "/root" "/boot" "/dev" "/proc" "/sys" "/tmp")
+  
+  for dir in "${safe_dirs[@]}"; do
+    if [[ "${target}" == "$dir" || "${target}" == "$dir/"* ]]; then
+      log_err "安全拒绝：拒绝删除系统目录 '$target'"
+      return 1
+    fi
+  done
+  
+  # 检查是否为空（防止意外删除）
+  if [[ -z "${target}" || "${target}" == "/"* ]]; then
+    log_err "目录为空或格式错误: '$target'"
+    return 1
+  fi
+  
+  # 交互式确认
+  read -p "确认删除目录 '$target' 及其所有内容？(输入 'DELETE' 确认): " confirm
+  if [[ "$confirm" != "DELETE" ]]; then
+    log_info "取消删除"
+    return 0
+  fi
+  
+  if [[ -d "$target" ]]; then
+    log_step "删除目录: $target"
+    rm -rf "$target"
+    return 0
+  fi
+  return 0
 }
 
 detect_os(){
@@ -51,6 +86,12 @@ detect_os(){
   fi
 }
 
+cleanup_temp(){
+  rm -f /tmp/board_mgr_task.log 2>/dev/null || true
+  rm -f /tmp/pip_up.log /tmp/pip_ins.log 2>/dev/null || true
+  rm -f /tmp/board_mgr_*.log 2>/dev/null || true
+}
+
 run_task(){
   local desc="$1"; shift
   local start_ts end_ts
@@ -58,6 +99,7 @@ run_task(){
 
   echo -ne "${BLUE}[⌛]${NC} ${desc} "
   set +e
+  cleanup_temp
   ("$@") >/tmp/board_mgr_task.log 2>&1 &
   local pid=$!
   local spin='-|/'
@@ -85,17 +127,20 @@ run_task(){
 help(){
   cat <<EOF
 ============================================================
-Board LAN Hub - v3.0 (Full+LoginPage+BasicAuth+DualStack) (单端口：8000)
+Board LAN Hub - v3.0 (安全优化版)
 ============================================================
 用法: $0 <命令> [选项]
 
 命令:
   install              安装系统（UI+API 同端口）
-  scan                 触发扫描并添加设备（调用 /api/scan/start）
+  scan                 触发扫描并添加设备
   status               查看后端服务状态
   restart              重启后端服务
   logs                 查看服务日志
-  uninstall            卸载系统
+  uninstall            卸载系统（安全模式）
+  uninstall --force    强制卸载（跳过确认）
+  backup               备份数据
+  restore              恢复数据
   set-ui-pass          修改 UI 登录密码
   set-port             修改服务端口
   help                 显示此帮助
@@ -144,47 +189,96 @@ auto_detect_cidr(){
 
 check_port(){
   local port="$1"
+  log_step "检查端口 ${port} ..."
+  
+  # 检查IPv4
   if ss -ltn 2>/dev/null | grep -q ":${port} "; then
     log_err "端口 ${port} 已被占用！"
     ss -ltnp 2>/dev/null | grep ":${port} " || true
     return 1
   fi
+  
+  # 检查IPv6
+  if ss -ltn 2>/dev/null | grep -q "\\[[0-9a-f:]*\\]:${port} "; then
+    log_err "端口 ${port} (IPv6) 已被占用！"
+    ss -ltnp 2>/dev/null | grep "\\[[0-9a-f:]*\\]:${port} " || true
+    return 1
+  fi
+  
   return 0
 }
 
 install_deps(){
   title "安装/检查系统依赖"
   detect_os
+  
+  if ! command -v curl >/dev/null 2>&1; then
+    run_task "安装 curl" bash -lc "apt-get install -y curl 2>/dev/null || yum install -y curl 2>/dev/null || true"
+  fi
+  
   if [[ "$OS_FAMILY" == "debian" ]]; then
     export DEBIAN_FRONTEND=noninteractive
-    run_task "apt-get update" bash -lc "apt-get update -y -qq"
-    run_task "安装系统依赖" bash -lc "apt-get install -y -qq git curl ca-certificates python3 python3-pip python3-venv sqlite3 iproute2 net-tools"
+    run_task "apt-get update" bash -lc "apt-get update -y -qq" || true
+    run_task "安装系统依赖" bash -lc "apt-get install -y -qq git ca-certificates python3 python3-pip python3-venv sqlite3 iproute2 net-tools" || {
+      log_err "依赖安装失败，请检查网络连接"
+      return 1
+    }
   else
-    run_task "安装系统依赖" bash -lc "$PKG install -y -q git curl ca-certificates python3 python3-pip sqlite iproute net-tools"
+    run_task "安装系统依赖" bash -lc "$PKG install -y -q git ca-certificates python3 python3-pip sqlite iproute net-tools" || {
+      log_err "依赖安装失败，请检查网络连接"
+      return 1
+    }
   fi
+  
+  # 检查关键命令
+  for cmd in python3 sqlite3; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      log_err "必需命令 $cmd 未安装"
+      return 1
+    fi
+  done
+  
   log_info "系统依赖 OK"
 }
 
 install_node(){
   title "安装/检查 Node.js"
   if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    log_info "已存在 node=$(node -v) npm=$(npm -v)"
-    return
+    local node_ver npm_ver
+    node_ver=$(node -v 2>/dev/null || echo "未知")
+    npm_ver=$(npm -v 2>/dev/null || echo "未知")
+    log_info "已存在 node=${node_ver} npm=${npm_ver}"
+    return 0
   fi
+  
   detect_os
   if [[ "$OS_FAMILY" == "debian" ]]; then
     run_task "安装 Node.js 20.x 源" bash -lc "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"
-    run_task "安装 nodejs" bash -lc "apt-get install -y -qq nodejs"
+    run_task "安装 nodejs" bash -lc "apt-get install -y -qq nodejs" || {
+      log_err "Node.js 安装失败"
+      return 1
+    }
   else
     run_task "安装 Node.js 20.x 源" bash -lc "curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
-    run_task "安装 nodejs" bash -lc "$PKG install -y -q nodejs"
+    run_task "安装 nodejs" bash -lc "$PKG install -y -q nodejs" || {
+      log_err "Node.js 安装失败"
+      return 1
+    }
   fi
+  
+  if ! command -v node >/dev/null 2>&1; then
+    log_err "Node.js 安装后未找到"
+    return 1
+  fi
+  
   log_info "Node OK：node=$(node -v) npm=$(npm -v)"
 }
 
 ensure_dirs(){
   title "准备目录"
   mkdir -p "${APPDIR}/app" "${APPDIR}/frontend/src" "${APPDIR}/data" "${APPDIR}/static" "${APPDIR}/bak"
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  mkdir -p "$BACKUP_DIR"
   log_info "目录 OK：${APPDIR}"
 }
 
@@ -210,6 +304,11 @@ pip_install_with_mirrors(){
       return 0
     fi
   done
+  
+  # 最后尝试不使用镜像
+  log_step "尝试默认pip源..."
+  "$pip" -q install "$@" >/tmp/pip_ins.log 2>&1 && return 0
+  
   tail -n 120 /tmp/pip_ins.log >&2 || true
   return 1
 }
@@ -222,11 +321,28 @@ write_backend(){
     run_task "创建 venv" bash -lc "python3 -m venv '$venv'"
   fi
 
-  run_task "pip 安装 fastapi/uvicorn/requests" bash -lc " \
+  if [[ ! -f "$venv/bin/python" ]]; then
+    log_err "Python虚拟环境创建失败"
+    return 1
+  fi
+
+  run_task "pip 安装依赖" bash -lc " \
     $(declare -f pip_install_with_mirrors); \
     pip_install_with_mirrors '$venv/bin/pip' fastapi 'uvicorn[standard]' requests \
   "
 
+  # 创建配置文件
+  cat > "$CONFIG_FILE" <<EOF
+# Board Manager 配置文件
+APPDIR="${APPDIR}"
+APIPORT="${APIPORT}"
+SCANUSER="${SCANUSER}"
+SCANPASS="${SCANPASS}"
+UIPASS="${UIPASS}"
+INSTALL_DATE="$(date +%Y-%m-%d)"
+EOF
+
+  # 后端代码保持不变（为节省空间，这里使用原有代码）
   cat > "${APPDIR}/app/main.py" <<'PY'
 import asyncio
 import json
@@ -854,10 +970,11 @@ def scanstart(cidr: Optional[str] = None, group: str = "auto", user: str = DEFAU
 PY
 
   log_info "后端已写入"
+  log_info "配置文件已创建: $CONFIG_FILE"
 }
 
 writefrontendstatic(){
-  title "部署前端（v3.0 + UI Patch，别名/分组/批量操作）"
+  title "部署前端（v3.0 + UI Patch）"
   local FE="${APPDIR}/frontend"
   mkdir -p "${FE}/src"
 
@@ -905,6 +1022,7 @@ import App from './App.vue'
 createApp(App).mount('#app')
 JS
 
+  # 前端代码保持不变（为节省空间）
   cat > "${FE}/src/App.vue" <<'VUE'
 <script setup>
 import { ref, computed } from 'vue'
@@ -1371,7 +1489,7 @@ async function saveSimSingle() {
             </thead>
             <tbody>
               <tr v-if="filteredDevices.length===0">
-                <td class="empty" colspan="6">暂无设备，点击“扫描添加”</td>
+                <td class="empty" colspan="6">暂无设备，点击"扫描添加"</td>
               </tr>
               <tr v-for="d in filteredDevices" :key="d.id">
                 <td>
@@ -1595,9 +1713,12 @@ label{font-size:12px;font-weight:900;color:#334155}
 </style>
 VUE
 
-  run_task "npm install" bash -lc "cd '$FE' && npm install --silent"
+  run_task "npm install" bash -lc "cd '$FE' && npm install --silent" || {
+    log_warn "npm install 失败，尝试使用淘宝源"
+    bash -lc "cd '$FE' && npm config set registry https://registry.npmmirror.com && npm install --silent"
+  }
   run_task "构建静态UI" bash -lc "cd '$FE' && npm run build --silent"
-  log_info "前端静态文件已输出到：${APPDIR}/static（通过 /static 访问）"
+  log_info "前端静态文件已输出到：${APPDIR}/static"
 }
 
 setupservice(){
@@ -1620,6 +1741,10 @@ Environment=BMUIPASS=${UIPASS}
 ExecStart=${APPDIR}/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port ${APIPORT}
 Restart=always
 RestartSec=2
+StandardOutput=journal
+StandardError=journal
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
@@ -1642,6 +1767,10 @@ Environment=BMUIPASS=${UIPASS}
 ExecStart=${APPDIR}/venv/bin/python -m uvicorn app.main:app --host :: --port ${APIPORT}
 Restart=always
 RestartSec=2
+StandardOutput=journal
+StandardError=journal
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
@@ -1652,35 +1781,200 @@ EOF
   systemctl enable board-manager-v6.service >/dev/null 2>&1 || true
   systemctl restart board-manager-v4.service
   systemctl restart board-manager-v6.service
-  log_info "服务已启动：board-manager-v4 / board-manager-v6"
+  
+  # 等待服务启动
+  sleep 2
+  if systemctl is-active --quiet board-manager-v4.service && \
+     systemctl is-active --quiet board-manager-v6.service; then
+    log_info "服务启动成功：board-manager-v4 / board-manager-v6"
+  else
+    log_warn "服务可能未完全启动，请检查日志"
+  fi
+}
+
+check_service_health(){
+  local max_attempts=10
+  local attempt=1
+  
+  while [[ $attempt -le $max_attempts ]]; do
+    if curl -s "http://127.0.0.1:${APIPORT}/api/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 status(){
-  systemctl status board-manager-v4.service board-manager-v6.service --no-pager
+  log_step "服务状态检查："
+  systemctl status board-manager-v4.service board-manager-v6.service --no-pager -l
+  
+  log_step "端口监听状态："
+  ss -ltnp | grep -E ":${APIPORT}|\\[::\\]:${APIPORT}" || log_info "端口 ${APIPORT} 未监听"
+  
+  log_step "服务健康检查："
+  if check_service_health; then
+    log_info "API 健康检查: ${GREEN}通过${NC}"
+  else
+    log_warn "API 健康检查: ${YELLOW}失败${NC}"
+  fi
 }
 
 logs(){
-  journalctl -u board-manager-v4.service -n 200 --no-pager
-  journalctl -u board-manager-v6.service -n 200 --no-pager
+  local lines="${1:-50}"
+  log_step "IPv4 服务日志（最近 ${lines} 行）："
+  journalctl -u board-manager-v4.service -n "$lines" --no-pager
+  echo ""
+  log_step "IPv6 服务日志（最近 ${lines} 行）："
+  journalctl -u board-manager-v6.service -n "$lines" --no-pager
 }
 
 restart(){
   systemctl restart board-manager-v4.service
   systemctl restart board-manager-v6.service
+  sleep 1
   status
+}
+
+backup_data(){
+  need_root
+  title "备份数据"
+  
+  local timestamp=$(date +%Y%m%d_%H%M%S)
+  local backup_file="${BACKUP_DIR}/board-manager_backup_${timestamp}.tar.gz"
+  
+  mkdir -p "$BACKUP_DIR"
+  
+  log_step "备份数据库和配置..."
+  tar -czf "$backup_file" \
+    -C "${APPDIR}" data \
+    "$CONFIG_FILE" \
+    "${SERVICEAPI4}" \
+    "${SERVICEAPI6}" 2>/dev/null
+  
+  if [[ $? -eq 0 ]]; then
+    log_info "备份成功: $backup_file"
+    log_info "大小: $(du -h "$backup_file" | cut -f1)"
+  else
+    log_err "备份失败"
+    return 1
+  fi
+}
+
+restore_data(){
+  need_root
+  title "恢复数据"
+  
+  if [[ -z "${1:-}" ]]; then
+    log_step "可用的备份文件："
+    ls -lt "${BACKUP_DIR}/"*.tar.gz 2>/dev/null | head -10
+    read -p "请输入备份文件路径: " backup_file
+  else
+    backup_file="$1"
+  fi
+  
+  if [[ ! -f "$backup_file" ]]; then
+    log_err "备份文件不存在: $backup_file"
+    return 1
+  fi
+  
+  log_step "停止服务..."
+  systemctl stop board-manager-v4.service >/dev/null 2>&1 || true
+  systemctl stop board-manager-v6.service >/dev/null 2>&1 || true
+  
+  log_step "解压备份..."
+  tar -xzf "$backup_file" -C / 2>/dev/null || {
+    log_err "解压失败"
+    return 1
+  }
+  
+  log_step "重启服务..."
+  systemctl restart board-manager-v4.service
+  systemctl restart board-manager-v6.service
+  
+  log_info "数据恢复完成"
 }
 
 uninstall(){
   need_root
-  title "卸载"
-  systemctl stop board-manager-v4.service >/dev/null 2>&1 || true
-  systemctl stop board-manager-v6.service >/dev/null 2>&1 || true
-  systemctl disable board-manager-v4.service >/dev/null 2>&1 || true
-  systemctl disable board-manager-v6.service >/dev/null 2>&1 || true
-  rm -f "${SERVICEAPI4}" "${SERVICEAPI6}"
+  local force_mode=false
+  
+  if [[ "${1:-}" == "--force" ]]; then
+    force_mode=true
+  fi
+  
+  title "安全卸载 Board LAN Hub"
+  
+  if [[ "$force_mode" != "true" ]]; then
+    echo ""
+    log_warn "⚠️  即将卸载以下内容："
+    log_warn "  - 服务文件: board-manager-v4 / board-manager-v6"
+    log_warn "  - 安装目录: ${APPDIR}"
+    log_warn "  - 配置文件: ${CONFIG_FILE}"
+    log_warn "  - 数据库: ${APPDIR}/data/data.db"
+    echo ""
+    read -p "是否确认卸载？(输入 'YES' 确认): " confirm
+    if [[ "$confirm" != "YES" ]]; then
+      log_info "取消卸载"
+      exit 0
+    fi
+    
+    read -p "是否备份数据？(y/N): " backup_confirm
+    if [[ "$backup_confirm" =~ ^[Yy]$ ]]; then
+      backup_data || log_warn "备份失败，继续卸载"
+    fi
+  fi
+  
+  log_step "停止服务..."
+  for svc in board-manager-v4 board-manager-v6; do
+    if systemctl is-active --quiet "$svc.service" 2>/dev/null; then
+      log_info "停止 $svc.service"
+      systemctl stop "$svc.service"
+      # 等待服务停止
+      for i in {1..5}; do
+        if ! systemctl is-active --quiet "$svc.service" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+    fi
+  done
+  
+  log_step "禁用服务..."
+  for svc in board-manager-v4 board-manager-v6; do
+    systemctl disable "$svc.service" 2>/dev/null || true
+  done
+  
+  log_step "移除服务文件..."
+  rm -f "${SERVICEAPI4}" "${SERVICEAPI6}" 2>/dev/null || true
+  
   systemctl daemon-reload
-  rm -rf "${APPDIR}"
-  log_info "卸载完成"
+  systemctl reset-failed 2>/dev/null || true
+  
+  log_step "清理安装目录..."
+  if [[ -d "${APPDIR}" ]]; then
+    if [[ "$force_mode" == "true" ]] || safe_delete "${APPDIR}"; then
+      log_info "已删除: ${APPDIR}"
+    fi
+  fi
+  
+  log_step "清理配置文件..."
+  rm -f "$CONFIG_FILE" 2>/dev/null || true
+  
+  log_step "清理临时文件..."
+  cleanup_temp
+  
+  log_step "清理NPM缓存..."
+  if command -v npm >/dev/null 2>&1; then
+    npm cache clean --force 2>/dev/null || true
+  fi
+  
+  log_info "✅ 卸载完成！"
+  echo ""
+  log_warn "注意：日志文件仍存在于 journal 中，可通过以下命令查看："
+  log_warn "  journalctl -u board-manager-v4.service"
+  log_warn "  journalctl -u board-manager-v6.service"
 }
 
 doscan(){
@@ -1698,7 +1992,7 @@ doscan(){
 
 installall(){
   need_root
-  title "安装 绿邮内网群控 单端口版"
+  title "安装 绿邮内网群控 安全优化版"
 
   if [[ -z "${APIPORT:-}" ]]; then APIPORT=8000; fi
   echo ""
@@ -1715,19 +2009,37 @@ installall(){
   log_info "UI密码已设置（长度：${#UIPASS}）"
 
   check_port "${APIPORT}" || exit 1
-  install_deps
-  install_node
+  install_deps || { log_err "依赖安装失败"; exit 1; }
+  install_node || { log_err "Node.js安装失败"; exit 1; }
   ensure_dirs
-  write_backend
-  writefrontendstatic
+  write_backend || { log_err "后端部署失败"; exit 1; }
+  writefrontendstatic || { log_err "前端部署失败"; exit 1; }
   setupservice
+  
+  # 等待服务启动
+  log_step "等待服务启动..."
+  if check_service_health; then
+    log_info "服务启动成功！"
+  else
+    log_warn "服务可能启动较慢，请稍后访问"
+  fi
 
   local ip
   ip=$(get_local_ip)
+  log_info "================================"
+  log_info "安装完成！"
   log_info "访问地址： http://${ip:-<服务器IP>}:${APIPORT}/"
   log_info "访问端口：${APIPORT}"
   log_info "登录方式：网页密码框"
   log_info "登录密码：${UIPASS}"
+  log_info "================================"
+  log_info "管理命令："
+  log_info "  $0 status      # 查看状态"
+  log_info "  $0 logs        # 查看日志"
+  log_info "  $0 restart     # 重启服务"
+  log_info "  $0 backup      # 备份数据"
+  log_info "  $0 uninstall   # 安全卸载"
+  log_info "================================"
 }
 
 CMD="${1:-help}"
@@ -1755,7 +2067,7 @@ set_ui_pass(){
   UIPASS="$newpass"
   setupservice
   restart
-  log_info "UI密码已更新：${UIPASS}"
+  log_info "UI密码已更新"
 }
 
 set_port(){
@@ -1767,6 +2079,8 @@ set_port(){
   if [[ -z "$newport" ]]; then
     log_err "端口不能为空"; exit 1
   fi
+  
+  check_port "$newport" || exit 1
   APIPORT="$newport"
   setupservice
   restart
@@ -1782,9 +2096,15 @@ case "$CMD" in
     ;;
   status) status ;;
   restart) restart ;;
-  logs) logs ;;
-  uninstall) uninstall ;;
+  logs) logs "$@" ;;
+  uninstall) uninstall "$@" ;;
+  backup) backup_data ;;
+  restore) restore_data "$@" ;;
   set-ui-pass) set_ui_pass "${1:-}" ;;
   set-port) set_port "${1:-}" ;;
   help|*) help ;;
 esac
+
+# 清理临时文件
+cleanup_temp
+exit 0
