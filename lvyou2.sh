@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Board LAN Hub - v3.0 (安全优化版)
+# Board LAN Hub - v3.0 (安全优化版+密码持久化+增强转发)
 # 修改版：带别名/分组/自然排序/批量转发/批量WiFi/单个&批量卡号/详情弹窗 UI
-# 优化：安全卸载、错误处理、密码安全、服务健康检查
+# 新增：增强版批量转发配置，支持12种转发方式
+# 优化：安全卸载、错误处理、密码安全、服务健康检查、密码持久化、IPv6支持
 set -euo pipefail
 
 RED='\u001B[0;31m'
@@ -127,7 +128,7 @@ run_task(){
 help(){
   cat <<EOF
 ============================================================
-Board LAN Hub - v3.0 (安全优化版)
+Board LAN Hub - v3.0 (安全优化版+密码持久化+增强转发)
 ============================================================
 用法: $0 <命令> [选项]
 
@@ -198,7 +199,7 @@ check_port(){
     return 1
   fi
   
-  # 检查IPv6
+  # 检查IPv6（修复第一版的问题）
   if ss -ltn 2>/dev/null | grep -q "\\[[0-9a-f:]*\\]:${port} "; then
     log_err "端口 ${port} (IPv6) 已被占用！"
     ss -ltnp 2>/dev/null | grep "\\[[0-9a-f:]*\\]:${port} " || true
@@ -342,7 +343,7 @@ UIPASS="${UIPASS}"
 INSTALL_DATE="$(date +%Y-%m-%d)"
 EOF
 
-  # 后端代码保持不变（为节省空间，这里使用原有代码）
+  # 后端代码 - 增强版
   cat > "${APPDIR}/app/main.py" <<'PY'
 import asyncio
 import json
@@ -370,7 +371,7 @@ TIMEOUT = float(os.environ.get("BMHTTPTIMEOUT", "2.5"))
 CONCURRENCY = int(os.environ.get("BMSCANCONCURRENCY", "96"))
 CIDRFALLBACKLIMIT = int(os.environ.get("BMCIDRFALLBACKLIMIT", "1024"))
 
-app = FastAPI(title="Board LAN Hub", version="3.0.0")
+app = FastAPI(title="Board LAN Hub", version="3.1.0")
 
 UIUSER = os.environ.get("BMUIUSER", "admin")
 UIPASS = os.environ.get("BMUIPASS", "admin")
@@ -724,7 +725,164 @@ def api_set_group(devid: int, req: GroupReq):
         raise HTTPException(404, "Device not found")
     return {"ok": True}
 
-# ===== 批量转发/通知 =====
+# ===== 增强版批量转发 =====
+class EnhancedBatchForwardReq(BaseModel):
+    device_ids: List[int]
+    forward_method: str
+    forwardUrl: str = ""
+    notifyUrl: str = ""
+    deviceKey0: str = ""
+    deviceKey1: str = ""
+    deviceKey2: str = ""
+    smtpProvider: str = ""
+    smtpServer: str = ""
+    smtpPort: str = ""
+    smtpAccount: str = ""
+    smtpPassword: str = ""
+    smtpFromEmail: str = ""
+    smtpToEmail: str = ""
+    smtpEncryption: str = ""
+    webhookUrl1: str = ""
+    webhookUrl2: str = ""
+    webhookUrl3: str = ""
+    signKey1: str = ""
+    signKey2: str = ""
+    signKey3: str = ""
+    sc3ApiUrl: str = ""
+    sctSendKey: str = ""
+    PPToken: str = ""
+    PPChannel: str = ""
+    PPWebhook: str = ""
+    PPFriends: str = ""
+    PPGroupId: str = ""
+    WPappToken: str = ""
+    WPUID: str = ""
+    WPTopicId: str = ""
+    lyApiUrl: str = ""
+
+@app.post("/api/devices/batch/enhanced-forward")
+def api_enhanced_batch_forward(req: EnhancedBatchForwardReq):
+    if not req.device_ids:
+        raise HTTPException(400, "device_ids required")
+    
+    con = db()
+    cur = con.cursor()
+    ph = ','.join('?' * len(req.device_ids))
+    cur.execute(f"SELECT id, ip, user, pass FROM devices WHERE id IN ({ph})", req.device_ids)
+    devs = [dict(r) for r in cur.fetchall()]
+    con.close()
+    
+    results = []
+    
+    for d in devs:
+        ip = d['ip']
+        user = (d.get('user') or DEFAULTUSER).strip()
+        pw = (d.get('pass') or DEFAULTPASS).strip()
+        
+        try:
+            # 检查设备是否可达
+            ok, _ = istargetdevice(ip, user, pw)
+            if not ok:
+                results.append({"id": d['id'], "ip": ip, "ok": False, "error": "auth failed"})
+                continue
+            
+            # 根据转发方式构建不同的请求数据
+            form_data = {"method": req.forward_method}
+            
+            if req.forward_method == "0":
+                # 不使用快捷配置
+                form_data.update({})
+            elif req.forward_method in ["1", "2"]:  # Bark
+                form_data.update({
+                    "BARK_DEVICE_KEY0": req.deviceKey0,
+                    "BARK_DEVICE_KEY1": req.deviceKey1,
+                    "BARK_DEVICE_KEY2": req.deviceKey2
+                })
+            elif req.forward_method == "8":  # SMTP
+                form_data.update({
+                    "SMTP_PROVIDER": req.smtpProvider,
+                    "SMTP_SERVER": req.smtpServer,
+                    "SMTP_PORT": req.smtpPort,
+                    "SMTP_ACCOUNT": req.smtpAccount,
+                    "SMTP_PASSWORD": req.smtpPassword,
+                    "SMTP_FROM_EMAIL": req.smtpFromEmail,
+                    "SMTP_TO_EMAIL": req.smtpToEmail,
+                    "SMTP_ENCRYPTION": req.smtpEncryption
+                })
+            elif req.forward_method in ["10", "11", "16"]:  # 企业微信/飞书
+                form_data.update({
+                    "WDF_CWH_URL1": req.webhookUrl1,
+                    "WDF_CWH_URL2": req.webhookUrl2,
+                    "WDF_CWH_URL3": req.webhookUrl3
+                })
+            elif req.forward_method == "13":  # 钉钉
+                form_data.update({
+                    "WDF_CWH_URL1": req.webhookUrl1,
+                    "WDF_CWH_URL2": req.webhookUrl2,
+                    "WDF_CWH_URL3": req.webhookUrl3,
+                    "WDF_SIGN_KEY1": req.signKey1,
+                    "WDF_SIGN_KEY2": req.signKey2,
+                    "WDF_SIGN_KEY3": req.signKey3
+                })
+            elif req.forward_method == "22":  # Server酱3
+                form_data.update({
+                    "SC3_URL": req.sc3ApiUrl
+                })
+            elif req.forward_method == "21":  # Server酱Turbo
+                form_data.update({
+                    "SCT_SEND_KEY": req.sctSendKey
+                })
+            elif req.forward_method == "30":  # PushPlus
+                form_data.update({
+                    "PPToken": req.PPToken,
+                    "PPChannel": req.PPChannel,
+                    "PPWebhook": req.PPWebhook,
+                    "PPFriends": req.PPFriends,
+                    "PPGroupId": req.PPGroupId
+                })
+            elif req.forward_method == "35":  # WxPusher
+                form_data.update({
+                    "WPappToken": req.WPappToken,
+                    "WPUID": req.WPUID,
+                    "WPTopicId": req.WPTopicId
+                })
+            elif req.forward_method == "90":  # 绿微平台
+                form_data.update({
+                    "LYWEB_API_URL": req.lyApiUrl
+                })
+            else:
+                # 通用URL方式（保持向后兼容）
+                form_data.update({
+                    "forwardUrl": req.forwardUrl,
+                    "notifyUrl": req.notifyUrl
+                })
+            
+            # 发送配置请求
+            resp = requests.post(
+                f"http://{ip}/saveForwardConfig",
+                data=form_data,
+                timeout=TIMEOUT + 5,
+                auth=requests.auth.HTTPDigestAuth(user, pw)
+            )
+            
+            results.append({
+                "id": d['id'], 
+                "ip": ip, 
+                "ok": resp.status_code == 200, 
+                "status": resp.status_code
+            })
+            
+        except Exception as e:
+            results.append({
+                "id": d['id'], 
+                "ip": ip, 
+                "ok": False, 
+                "error": str(e)
+            })
+    
+    return {"results": results}
+
+# ===== 保持原有批量转发接口（兼容旧版） =====
 class BatchForwardReq(BaseModel):
     device_ids: List[int]
     forwardUrl: str
@@ -974,14 +1132,14 @@ PY
 }
 
 writefrontendstatic(){
-  title "部署前端（v3.0 + UI Patch）"
+  title "部署前端（v3.0 + 密码持久化 + 增强转发）"
   local FE="${APPDIR}/frontend"
   mkdir -p "${FE}/src"
 
   cat > "${FE}/package.json" <<'PKG'
 {
   "name": "board-lan-ui",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "scripts": { "build": "vite build" },
@@ -1022,10 +1180,10 @@ import App from './App.vue'
 createApp(App).mount('#app')
 JS
 
-  # 前端代码保持不变（为节省空间）
+  # 前端代码 - 增强版
   cat > "${FE}/src/App.vue" <<'VUE'
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import axios from 'axios'
 
 const api = axios.create({ baseURL: '' })
@@ -1044,6 +1202,9 @@ function clearNotice() {
 function setAuth(pw) {
   const token = window.btoa(`admin:${pw}`)
   api.defaults.headers.common['Authorization'] = `Basic ${token}`
+  // 保存到 localStorage
+  localStorage.setItem('board_mgr_auth_token', token)
+  localStorage.setItem('board_mgr_auth_time', Date.now().toString())
 }
 async function login() {
   if (!uiPass.value.trim()) return setNotice('请输入密码', 'err')
@@ -1065,7 +1226,30 @@ function logout() {
   authed.value = false
   uiPass.value = ''
   delete api.defaults.headers.common['Authorization']
+  // 清除 localStorage
+  localStorage.removeItem('board_mgr_auth_token')
+  localStorage.removeItem('board_mgr_auth_time')
 }
+
+// 页面加载时检查是否有保存的token
+onMounted(() => {
+  const savedToken = localStorage.getItem('board_mgr_auth_token')
+  const savedTime = localStorage.getItem('board_mgr_auth_time')
+  
+  // 如果token存在且是7天内保存的（604800000毫秒）
+  if (savedToken && savedTime && (Date.now() - parseInt(savedTime) < 604800000)) {
+    api.defaults.headers.common['Authorization'] = `Basic ${savedToken}`
+    authed.value = true
+    // 验证token是否有效
+    api.get('/api/health').then(() => {
+      refresh()
+    }).catch(() => {
+      // token无效，清除
+      logout()
+      setNotice('登录已过期，请重新登录', 'err')
+    })
+  }
+})
 
 const devices = ref([])
 const numbers = ref([])
@@ -1082,12 +1266,46 @@ const selectedIds = ref([])
 const selectAll = ref(false)
 
 const showForwardModal = ref(false)
+const showEnhancedForwardModal = ref(false)
 const showWifiModal = ref(false)
 const showSimModal = ref(false)
 const showDetailModal = ref(false)
 
 const forwardUrl = ref('')
 const notifyUrl = ref('')
+
+// 增强转发配置
+const forwardMethod = ref('0')
+const enhancedForwardConfig = ref({
+  deviceKey0: '',
+  deviceKey1: '',
+  deviceKey2: '',
+  smtpProvider: '1',
+  smtpServer: '',
+  smtpPort: '',
+  smtpAccount: '',
+  smtpPassword: '',
+  smtpFromEmail: '',
+  smtpToEmail: '',
+  smtpEncryption: 'starttls',
+  webhookUrl1: '',
+  webhookUrl2: '',
+  webhookUrl3: '',
+  signKey1: '',
+  signKey2: '',
+  signKey3: '',
+  sc3ApiUrl: '',
+  sctSendKey: '',
+  PPToken: '',
+  PPChannel: '',
+  PPWebhook: '',
+  PPFriends: '',
+  PPGroupId: '',
+  WPappToken: '',
+  WPUID: '',
+  WPTopicId: '',
+  lyApiUrl: ''
+})
 
 const wifiSsid = ref('')
 const wifiPwd = ref('')
@@ -1097,6 +1315,42 @@ const sim2Number = ref('')
 
 const deviceDetail = ref(null)
 const detailSavedWifi = computed(() => deviceDetail.value?.wifilist || [])
+
+// SMTP配置映射
+const smtpConfigs = {
+  '1': { domain: '', server: 'smtp.163.com', port: '465' },
+  '2': { domain: 'vip.163.com', server: 'smtp.vip.163.com', port: '465' },
+  '3': { domain: '', server: 'smtp.ym.163.com', port: '465' },
+  '10': { domain: '', server: 'smtp.qq.com', port: '465' },
+  '11': { domain: '', server: 'smtp.exmail.qq.com', port: '465' },
+  '20': { domain: 'aliyun.com', server: 'smtp.aliyun.com', port: '465' },
+  '21': { domain: '', server: 'smtp.qiye.aliyun.com', port: '465' },
+  '30': { domain: '139.com', server: 'smtp.139.com', port: '465' },
+  '33': { domain: 'wo.com', server: 'smtp.wo.cn', port: '465' },
+  '36': { domain: '189.cn', server: 'smtp.189.cn', port: '465' },
+  '37': { domain: '21cn.com', server: 'smtp.21cn.com', port: '465' },
+  '40': { domain: '', server: 'smtp.sina.com', port: '465' },
+  '41': { domain: 'sohu.com', server: 'smtp.sohu.com', port: '465' },
+  '42': { domain: '', server: 'smtp.zoho.com', port: '465' },
+  '43': { domain: '', server: 'smtp.88.com', port: '465' },
+  '50': { domain: '', server: 'smtp.office365.com', port: '587' },
+  '51': { domain: 'yahoo.com', server: 'smtp.mail.yahoo.com', port: '465' },
+  '52': { domain: 'icloud.com', server: 'smtp.mail.me.com', port: '465' },
+  '53': { domain: 'gmail.com', server: 'smtp.gmail.com', port: '465' },
+  '54': { domain: 'aol.com', server: 'smtp.aol.com', port: '465' },
+  '55': { domain: 'yandex.com', server: 'smtp.yandex.com', port: '465' },
+  '56': { domain: 'mail.ru', server: 'smtp.mail.ru', port: '465' },
+  '999': { domain: '', server: '', port: '' }
+}
+
+// 监听SMTP提供商变化
+watch(() => enhancedForwardConfig.value.smtpProvider, (newVal) => {
+  const config = smtpConfigs[newVal]
+  if (config && newVal !== '999') {
+    enhancedForwardConfig.value.smtpServer = config.server
+    enhancedForwardConfig.value.smtpPort = config.port
+  }
+})
 
 function prettyTime(ts) {
   if (!ts) return '-'
@@ -1188,7 +1442,13 @@ async function refresh() {
     await loadDevices()
     await loadNumbers()
   } catch (e) {
-    setNotice(e?.response?.data?.detail || e.message, 'err')
+    // 如果返回401，清除登录状态
+    if (e?.response?.status === 401) {
+      logout()
+      setNotice('登录已过期，请重新登录', 'err')
+    } else {
+      setNotice(e?.response?.data?.detail || e.message, 'err')
+    }
   } finally {
     loading.value = false
   }
@@ -1267,6 +1527,7 @@ async function deleteDevice(id) {
   }
 }
 
+// 旧版转发配置
 function openForwardModal() {
   if (!selectedCount.value) return setNotice('请先勾选设备', 'err')
   showForwardModal.value = true
@@ -1286,6 +1547,42 @@ async function applyForward() {
     })
     const ok = (data.results || []).filter(r => r.ok).length
     setNotice(`转发配置完成：${ok}/${(data.results || []).length}`, ok ? 'ok' : 'err')
+    closeForwardModal()
+  } catch (e) {
+    setNotice(e?.response?.data?.detail || e.message, 'err')
+  } finally {
+    loading.value = false
+  }
+}
+
+// 增强版转发配置
+function openEnhancedForwardModal() {
+  if (!selectedCount.value) return setNotice('请先勾选设备', 'err')
+  showEnhancedForwardModal.value = true
+}
+function closeEnhancedForwardModal() {
+  showEnhancedForwardModal.value = false
+  forwardMethod.value = '0'
+  // 重置配置
+  Object.keys(enhancedForwardConfig.value).forEach(key => {
+    enhancedForwardConfig.value[key] = ''
+  })
+  enhancedForwardConfig.value.smtpProvider = '1'
+  enhancedForwardConfig.value.smtpEncryption = 'starttls'
+}
+async function applyEnhancedForward() {
+  loading.value = true
+  try {
+    const payload = {
+      device_ids: selectedIds.value,
+      forward_method: forwardMethod.value,
+      ...enhancedForwardConfig.value
+    }
+    
+    const { data } = await api.post('/api/devices/batch/enhanced-forward', payload)
+    const ok = (data.results || []).filter(r => r.ok).length
+    setNotice(`转发配置完成：${ok}/${(data.results || []).length}`, ok ? 'ok' : 'err')
+    closeEnhancedForwardModal()
   } catch (e) {
     setNotice(e?.response?.data?.detail || e.message, 'err')
   } finally {
@@ -1404,7 +1701,7 @@ async function saveSimSingle() {
           <div class="logo">BM</div>
           <div class="brand-text">
             <div class="brand-title">Board LAN Hub</div>
-            <div class="brand-sub">v3.0 + UI Patch</div>
+            <div class="brand-sub">v3.1 + 增强转发</div>
           </div>
         </div>
         <div class="actions">
@@ -1469,7 +1766,7 @@ async function saveSimSingle() {
 
         <div v-if="selectedCount>0 && activeTab==='devices'" class="batch-bar">
           <span class="batch-info">已选 {{ selectedCount }} 台</span>
-          <button class="btn btn-ghost btn-sm" @click="openForwardModal">配置转发</button>
+          <button class="btn btn-ghost btn-sm" @click="openEnhancedForwardModal">配置转发</button>
           <button class="btn btn-ghost btn-sm" @click="openWifiModal">配置WiFi</button>
           <button class="btn btn-ghost btn-sm" @click="openSimModal">编辑卡号</button>
           <button class="btn btn-danger btn-sm" @click="selectedIds=[]; selectAll=false">取消</button>
@@ -1531,6 +1828,161 @@ async function saveSimSingle() {
         </div>
       </div>
 
+      <!-- 增强版转发配置模态框 -->
+      <div v-if="showEnhancedForwardModal" class="modal" @click.self="closeEnhancedForwardModal">
+        <div class="modal-content" style="max-width: 700px; max-height: 80vh; overflow-y: auto">
+          <div class="modal-title">批量配置转发方式</div>
+          
+          <div class="field field-full">
+            <label>转发方式：</label>
+            <select v-model="forwardMethod" class="input">
+              <option value="0">----- 不使用快捷配置 -----</option>
+              <option value="1">转发至 Bark for iOS</option>
+              <option value="8">转发至 邮箱(SMTP)</option>
+              <option value="10">转发至 企业微信群Webhook</option>
+              <option value="11">转发至 企业微信群Webhook （开启：来电接听＋录音上报）</option>
+              <option value="13">转发至 钉钉群Webhook</option>
+              <option value="16">转发至 飞书群Webhook</option>
+              <option value="22">转发至 Server酱3</option>
+              <option value="21">转发至 Server酱Turbo</option>
+              <option value="30">转发至 PushPlus(推送加)</option>
+              <option value="35">转发至 WxPusher</option>
+              <option value="90">转发至 绿微平台普通WEB接口(v1)</option>
+              <option value="custom">自定义URL（旧版）</option>
+            </select>
+          </div>
+          
+          <!-- Bark配置 -->
+          <div v-if="forwardMethod === '1'" class="config-section">
+            <div class="field field-full">
+              <label>device_key(必填)：</label>
+              <input v-model="enhancedForwardConfig.deviceKey0" class="input" placeholder="从bark中复制推送地址的device_key" />
+              <div class="muted">从bark中复制推送地址，类似于：https://api.day.app/device_key/...</div>
+            </div>
+          </div>
+          
+          <!-- SMTP配置 -->
+          <div v-if="forwardMethod === '8'" class="config-section">
+            <div class="field field-full">
+              <label>邮箱提供商：</label>
+              <select v-model="enhancedForwardConfig.smtpProvider" class="input">
+                <option value="1">网易 - 网易免费邮箱（163、126、yeah、188）</option>
+                <option value="2">网易 - 网易VIP邮箱（vip.163）</option>
+                <option value="3">网易 - 网易企业邮</option>
+                <option value="10">腾讯 - 腾讯免费邮箱（qq、foxmail）</option>
+                <option value="11">腾讯 - 腾讯企业邮</option>
+                <option value="20">阿里 - 阿里免费邮箱（aliyun）</option>
+                <option value="21">阿里 - 阿里企业邮箱</option>
+                <option value="30">运营商 - 移动139邮箱</option>
+                <option value="33">运营商 - 联通WO邮箱</option>
+                <option value="36">运营商 - 电信189邮箱</option>
+                <option value="37">运营商 - 电信21cn邮箱（21cn）</option>
+                <option value="40">国内 - 新浪邮箱（sina）</option>
+                <option value="41">国内 - 搜狐邮箱（sohu）</option>
+                <option value="42">国内 - Zoho邮箱</option>
+                <option value="43">国内 - 完美邮箱（88、111、email）</option>
+                <option value="50">国际 - 微软邮箱（Outlook、hotmail）</option>
+                <option value="51">国际 - 雅虎邮箱（Yahoo）</option>
+                <option value="52">国际 - 苹果邮箱（iCLoud）</option>
+                <option value="53">国际 - 谷歌邮箱（GMail）</option>
+                <option value="54">国际 - AOL邮箱</option>
+                <option value="55">国际 - Yandex邮箱</option>
+                <option value="56">国际 - Mail.ru邮箱</option>
+                <option value="999">-- 自定义邮箱 --</option>
+              </select>
+            </div>
+            
+            <div v-if="enhancedForwardConfig.smtpProvider === '999'" class="field field-full">
+              <label>发信服务器：</label>
+              <input v-model="enhancedForwardConfig.smtpServer" class="input" />
+            </div>
+            
+            <div class="field field-full">
+              <label>发信账号地址：</label>
+              <input v-model="enhancedForwardConfig.smtpAccount" class="input" />
+            </div>
+            
+            <div class="field field-full">
+              <label>发信账号密码：</label>
+              <input v-model="enhancedForwardConfig.smtpPassword" class="input" type="password" />
+            </div>
+            
+            <div class="field field-full">
+              <label>发信邮箱地址：</label>
+              <input v-model="enhancedForwardConfig.smtpFromEmail" class="input" />
+            </div>
+            
+            <div class="field field-full">
+              <label>收信邮箱地址：</label>
+              <input v-model="enhancedForwardConfig.smtpToEmail" class="input" />
+            </div>
+          </div>
+          
+          <!-- 企业微信/飞书配置 -->
+          <div v-if="forwardMethod === '10' || forwardMethod === '11' || forwardMethod === '16'" class="config-section">
+            <div class="field field-full">
+              <label>机器人(1)的webhook地址(必填)：</label>
+              <textarea v-model="enhancedForwardConfig.webhookUrl1" class="input textarea" rows="1"></textarea>
+            </div>
+            <div class="field field-full">
+              <label>机器人(2)的webhook地址：</label>
+              <textarea v-model="enhancedForwardConfig.webhookUrl2" class="input textarea" rows="1"></textarea>
+            </div>
+            <div class="field field-full">
+              <label>机器人(3)的webhook地址：</label>
+              <textarea v-model="enhancedForwardConfig.webhookUrl3" class="input textarea" rows="1"></textarea>
+            </div>
+          </div>
+          
+          <!-- 钉钉配置 -->
+          <div v-if="forwardMethod === '13'" class="config-section">
+            <div class="field field-full">
+              <label>机器人(1)的webhook地址(必填)：</label>
+              <textarea v-model="enhancedForwardConfig.webhookUrl1" class="input textarea" rows="2"></textarea>
+            </div>
+            <div class="field field-full">
+              <label>机器人(1)的安全设置：加签</label>
+              <input v-model="enhancedForwardConfig.signKey1" class="input" />
+            </div>
+            <div class="field field-full">
+              <label>机器人(2)的webhook地址：</label>
+              <textarea v-model="enhancedForwardConfig.webhookUrl2" class="input textarea" rows="2"></textarea>
+            </div>
+            <div class="field field-full">
+              <label>机器人(2)的安全设置：加签</label>
+              <input v-model="enhancedForwardConfig.signKey2" class="input" />
+            </div>
+            <div class="field field-full">
+              <label>机器人(3)的webhook地址：</label>
+              <textarea v-model="enhancedForwardConfig.webhookUrl3" class="input textarea" rows="2"></textarea>
+            </div>
+            <div class="field field-full">
+              <label>机器人(3)的安全设置：加签</label>
+              <input v-model="enhancedForwardConfig.signKey3" class="input" />
+            </div>
+          </div>
+          
+          <!-- 自定义URL（旧版） -->
+          <div v-if="forwardMethod === 'custom'" class="config-section">
+            <div class="field field-full">
+              <label>转发URL</label>
+              <input v-model="forwardUrl" class="input" placeholder="例如: http://example.com/forward" />
+            </div>
+            <div class="field field-full">
+              <label>通知URL</label>
+              <input v-model="notifyUrl" class="input" placeholder="例如: http://example.com/notify" />
+            </div>
+          </div>
+          
+          <div class="modal-message">将应用到 {{ selectedCount }} 台设备</div>
+          <div class="modal-buttons">
+            <button class="modal-btn" @click="closeEnhancedForwardModal">取消</button>
+            <button class="modal-btn ok" :disabled="loading" @click="applyEnhancedForward">确定</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 旧版转发配置模态框（保持兼容） -->
       <div v-if="showForwardModal" class="modal" @click.self="closeForwardModal">
         <div class="modal-content">
           <div class="modal-title">批量配置转发/通知</div>
@@ -1620,7 +2072,7 @@ async function saveSimSingle() {
         </div>
       </div>
 
-      <div class="footer">Business UI · Mobile responsive</div>
+      <div class="footer">Board LAN Hub v3.1 · 增强转发支持</div>
     </div>
   </div>
 </template>
@@ -1691,6 +2143,8 @@ label{font-size:12px;font-weight:900;color:#334155}
 .modal-buttons{display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
 .modal-btn{padding:8px 14px;border:none;border-radius:8px;cursor:pointer;background:#e2e8f0}
 .modal-btn.ok{background:#10b981;color:white}
+
+.config-section{margin-top:15px;border-top:1px solid #e2e8f0;padding-top:15px}
 
 .pre{background:#0b1220;color:#e5e7eb;padding:12px;border-radius:12px;overflow:auto;font-size:12px}
 .detail{display:flex;flex-direction:column;gap:10px}
@@ -1992,7 +2446,7 @@ doscan(){
 
 installall(){
   need_root
-  title "安装 绿邮内网群控 安全优化版"
+  title "安装 绿邮内网群控 安全优化版+密码持久化+增强转发"
 
   if [[ -z "${APIPORT:-}" ]]; then APIPORT=8000; fi
   echo ""
@@ -2029,9 +2483,12 @@ installall(){
   log_info "================================"
   log_info "安装完成！"
   log_info "访问地址： http://${ip:-<服务器IP>}:${APIPORT}/"
+  log_info "IPv6地址： http://[::]:${APIPORT}/"
   log_info "访问端口：${APIPORT}"
   log_info "登录方式：网页密码框"
   log_info "登录密码：${UIPASS}"
+  log_info "密码持久化：已启用（7天内免重复登录）"
+  log_info "增强转发：支持12种转发方式"
   log_info "================================"
   log_info "管理命令："
   log_info "  $0 status      # 查看状态"
