@@ -50,7 +50,7 @@ safe_delete(){
     fi
   done
   
-  if [[ -z "${target}" || "${target}" == "/"* ]]; then
+  if [[ -z "${target}" || "${target}" == "/" ]]; then
     log_err "目录为空或格式错误: '$target'"
     return 1
   fi
@@ -372,6 +372,7 @@ EOF
   # 后端代码 - 关键修复：使用第一版本的扫描逻辑
   cat > "${APPDIR}/app/main.py" <<'PY'
 import asyncio
+import threading
 import json
 import os
 import re
@@ -416,10 +417,10 @@ class Device(Base):
     __tablename__ = "devices"
     
     id = Column(Integer, primary_key=True, index=True)
-    devId = Column(String(128), nullable=True)
+    devId = Column(String(128), unique=True, nullable=True)
     grp = Column(String(64), default='auto')
     ip = Column(String(45), unique=True, index=True, nullable=False)
-    mac = Column(String(32), default='')
+    mac = Column(String(32), unique=True, nullable=True, default='')
     user = Column(String(64), default='')
     passwd = Column(String(64), default='')
     status = Column(String(32), default='unknown')
@@ -614,7 +615,10 @@ def getdevicedata(ip: str, user: str, pw: str) -> Optional[Dict[str, Any]]:
         return None
 
 def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: str = "auto") -> Dict[str, Any]:
-    """同步版本：插入或更新设备"""
+    """同步版本：插入或更新设备（去重优先级：DEV_ID > MAC > IP）
+    - 解决：设备 IP 变化导致重复记录
+    - 若历史遗留重复（旧版本按 IP 唯一），会在更新时自动清理冲突 IP 记录
+    """
     data = getdevicedata(ip, user, pw) or {}
     devid = (data.get("DEV_ID") or "").strip() or None
     sim1num = (data.get("SIM1_PHNUM") or "").strip()
@@ -622,16 +626,35 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: str = 
     sim1op = (data.get("SIM1_OP") or "").strip()
     sim2op = (data.get("SIM2_OP") or "").strip()
 
-    mac = (mac or "").strip().upper()
-    
-    # 检查是否已存在
-    device = db.query(Device).filter(Device.ip == ip).first()
-    
+    mac = (mac or "").strip().upper() or None
+
+    # 先按 DEV_ID / MAC / IP 查找（唯一性优先级）
+    device: Optional[Device] = None
+    if devid:
+        device = db.query(Device).filter(Device.devId == devid).first()
+    if not device and mac:
+        device = db.query(Device).filter(Device.mac == mac).first()
+    if not device:
+        device = db.query(Device).filter(Device.ip == ip).first()
+
+    # 如果我们是通过 devid/mac 找到设备，且当前 ip 已被“历史重复记录”占用，则清理冲突记录
+    if device and device.ip != ip:
+        other = db.query(Device).filter(Device.ip == ip).first()
+        if other and other.id != device.id:
+            try:
+                db.delete(other)
+                db.flush()
+            except Exception:
+                db.rollback()
+                # 清理失败不影响主流程，继续更新
+                db.begin()
+
     if device:
         # 更新现有设备
         device.devId = devid if devid else device.devId
         device.grp = grp
-        device.mac = mac if mac else device.mac
+        device.ip = ip
+        device.mac = (mac if mac else device.mac)
         device.user = user
         device.passwd = pw
         device.status = 'online'
@@ -646,7 +669,7 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: str = 
             devId=devid,
             grp=grp,
             ip=ip,
-            mac=mac,
+            mac=(mac or ""),
             user=user,
             passwd=pw,
             status='online',
@@ -658,10 +681,10 @@ def upsertdevice(db: Session, ip: str, mac: str, user: str, pw: str, grp: str = 
             created=subprocess.check_output(["date", "+%Y-%m-%d %H:%M:%S"], text=True).strip()
         )
         db.add(device)
-    
+
     db.commit()
     db.refresh(device)
-    
+
     return {
         "id": device.id,
         "devId": device.devId or "",
@@ -1111,6 +1134,40 @@ def deletedevice(dev_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "message": "Device deleted"}
 
+class BatchDeleteReq(BaseModel):
+    device_ids: List[int]
+
+@app.post("/api/devices/batch/delete")
+def api_batch_delete(req: BatchDeleteReq, db: Session = Depends(get_db)):
+    if not req.device_ids:
+        raise HTTPException(400, "device_ids required")
+    deleted = 0
+    for dev_id in req.device_ids:
+        device = db.query(Device).filter(Device.id == dev_id).first()
+        if device:
+            db.delete(device)
+            deleted += 1
+    db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
+class BatchDeleteReq(BaseModel):
+    device_ids: List[int]
+
+@app.post("/api/devices/batch/delete")
+def api_batch_delete(req: BatchDeleteReq, db: Session = Depends(get_db)):
+    if not req.device_ids:
+        raise HTTPException(400, "device_ids required")
+    deleted = 0
+    for dev_id in req.device_ids:
+        device = db.query(Device).filter(Device.id == dev_id).first()
+        if device:
+            db.delete(device)
+            deleted += 1
+    db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
 @app.post("/api/sms/send-direct")
 def smssenddirect(req: DirectSmsReq, db: Session = Depends(get_db)):
     if req.slot not in (1, 2):
@@ -1198,6 +1255,7 @@ def scanstart(
         iplist = iplist[:CIDRFALLBACKLIMIT]
 
     found: List[Dict[str, Any]] = []
+    found_lock = threading.Lock()
     
     # 线程池函数
     def probe(ip: str):
@@ -1208,7 +1266,8 @@ def scanstart(
             thread_db = SessionLocal()
             try:
                 d = upsertdevice(thread_db, ip, mac, user, password, group)
-                found.append(d)
+                with found_lock:
+                    found.append(d)
             finally:
                 thread_db.close()
             return True
@@ -1537,7 +1596,7 @@ async function loadNumbers() {
     numbers.value = Array.isArray(data) ? data : []
     if (!fromSelected.value && numbers.value.length) {
       const n = numbers.value[0]
-      fromSelected.value = `${n.deviceId}|${n.slot}|${n.number}`
+      fromSelected.value = `${n.deviceId}|${n.slot}`
     }
   } catch (e) {
     setNotice('加载号码失败：' + (e?.response?.data?.detail || e.message), 'err')
@@ -1724,25 +1783,15 @@ async function applyWifi() {
   }
 }
 
-function openSimModal() {
+async function batchDeleteSelected() {
   if (!selectedCount.value) return setNotice('请先勾选设备', 'err')
-  showSimModal.value = true
-}
-function closeSimModal() {
-  showSimModal.value = false
-  sim1Number.value = ''
-  sim2Number.value = ''
-}
-async function applySim() {
+  if (!confirm(`确认删除所选 ${selectedCount.value} 台设备？`)) return
   loading.value = true
   try {
-    const { data } = await api.post('/api/devices/batch/sim', {
-      device_ids: selectedIds.value,
-      sim1: sim1Number.value.trim(),
-      sim2: sim2Number.value.trim(),
-    })
-    const ok = (data.results || []).filter(r => r.ok).length
-    setNotice(`卡号批量更新：${ok}/${(data.results || []).length}`, ok ? 'ok' : 'err')
+    const { data } = await api.post('/api/devices/batch/delete', { device_ids: selectedIds.value })
+    setNotice(`删除完成：${data.deleted || 0}/${selectedCount.value}`, (data.deleted || 0) ? 'ok' : 'warn')
+    selectedIds.value = []
+    selectAll.value = false
     await refresh()
   } catch (e) {
     setNotice(e?.response?.data?.detail || e.message, 'err')
@@ -1881,8 +1930,8 @@ async function saveSimSingle() {
             <label>发送卡号：</label>
             <select v-model="fromSelected" class="form-select">
               <option value="">请选择发送卡</option>
-              <option v-for="n in numbers" :key="`${n.deviceId}-${n.slot}`" :value="`${n.deviceId}|${n.slot}|${n.number}`">
-                {{ n.number }} ({{ n.deviceName }})
+              <option v-for="n in numbers" :key="`${n.deviceId}-${n.slot}`" :value="`${n.deviceId}|${n.slot}`">
+                {{ n.number }}
               </option>
             </select>
           </div>
@@ -1950,7 +1999,7 @@ async function saveSimSingle() {
         <div v-if="selectedCount > 0 && activeTab === 'devices'" class="batch-bar">
           <span class="batch-count">已选择 {{ selectedCount }} 台设备</span>
           <div class="batch-actions">
-            <button class="batch-btn" @click="openSimModal">📞 编辑卡号</button>
+            <button class="batch-btn" @click="batchDeleteSelected">🗑 删除设备</button>
             <button class="batch-btn cancel" @click="selectedIds = []; selectAll = false">取消选择</button>
           </div>
         </div>
@@ -3619,4 +3668,4 @@ case "$CMD" in
 esac
 
 cleanup_temp
-exit 0
+exit 0mdc
