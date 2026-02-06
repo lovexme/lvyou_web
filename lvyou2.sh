@@ -3668,4 +3668,4 @@ case "$CMD" in
 esac
 
 cleanup_temp
-exit 0mdc
+exit 0
