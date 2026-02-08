@@ -1,122 +1,235 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+# 补丁脚本：修复板卡管理器 SIM 运营商显示问题
+# GitHub: https://github.com/yourusername/board-manager-patches
 
-# 配置项：根据你的实际安装路径修改
+set -e
+
 ROOT="/opt/board-manager"
 MAIN="$ROOT/app/main.py"
 APPVUE="$ROOT/frontend/src/App.vue"
 FRONT="$ROOT/frontend"
-BACKUP_DIR="$ROOT/backups"
 
-# 创建备份目录
-mkdir -p "$BACKUP_DIR"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+echo "=== [1/3] 后端补丁：operator 使用 SIM*_STA（保留 460xx） ==="
+if [ ! -f "$MAIN" ]; then
+    echo "❌ 找不到 $MAIN（安装路径可能不同）"
+    echo "请检查安装目录，或修改脚本中的 ROOT 变量"
+    exit 1
+fi
 
-# ===================== 工具函数 =====================
-# 安全替换文件（保留备份）
-safe_replace() {
-    local file=$1
-    local backup_suffix=$2
-    cp -a "$file" "$BACKUP_DIR/$(basename $file).$backup_suffix.$TIMESTAMP"
-    cp -a "$file" "$file.bak.$TIMESTAMP"
-}
+# 备份原文件
+BACKUP="$MAIN.bak.$(date +%Y%m%d_%H%M%S)"
+cp -p "$MAIN" "$BACKUP"
+echo "✅ 已备份到: $BACKUP"
 
-# 检查文件存在
-check_file() {
-    local file=$1
-    local desc=$2
-    if [[ ! -f "$file" ]]; then
-        echo "❌ 找不到 $desc：$file"
-        exit 1
+# 使用 sed 和 awk 进行修改（纯 sh 方案）
+{
+    # 添加 import re（如果不存在）
+    if ! grep -q '^[[:space:]]*import[[:space:]]\+re[[:space:]]*$' "$MAIN"; then
+        awk '
+        /^[[:space:]]*(import|from)[[:space:]]/ { last_import = NR }
+        END {
+            if (last_import) {
+                # 在最后一行import后添加
+                system("sed -i \"" last_import + 1 "i import re\" '"$MAIN"'")
+            } else {
+                # 文件开头添加
+                system("sed -i \"1i import re\" '"$MAIN"'")
+            }
+        }' "$MAIN"
     fi
-}
-
-# ===================== 1. 后端补丁（main.py）=====================
-echo "=== [1/3] 后端补丁：operator 使用 SIM*_STA（保留 460xx）==="
-check_file "$MAIN" "main.py"
-safe_replace "$MAIN" "main.py"
-
-# 1.1 确保导入 re（单行 awk，避免换行解析错误）
-if ! grep -q "^import re" "$MAIN" && ! grep -q "^from re import" "$MAIN"; then
-    awk '/^(import|from)\s+/ {last_import=NR} {lines[NR]=$0} END {for(i=1;i<=last_import;i++) print lines[i]; print "import re"; for(i=last_import+1;i<=NR;i++) print lines[i]}' "$MAIN" > "$MAIN.tmp" && mv "$MAIN.tmp" "$MAIN"
-fi
-
-# 1.2 注入/覆盖 _bm_op_from_sta 函数（单行 awk + 转义）
-FUNC_DEF="def _bm_op_from_sta(sta: str) -> str:    \"\"\"从 SIM*_STA 取运营商显示，保留完整 '移动(46001)' 形式\"\"\"    return (sta or \"\").strip()"
-if grep -q "def _bm_op_from_sta" "$MAIN"; then
-    # 覆盖现有函数
-    awk -v func="$FUNC_DEF" '/def _bm_op_from_sta/ {print func; in_func=1; next} in_func && /^def/ {in_func=0; print} !in_func {print}' "$MAIN" > "$MAIN.tmp" && mv "$MAIN.tmp" "$MAIN"
-else
-    # 插入到 import 后（单行 awk）
-    awk '/^(import|from)\s+/ {last_import=NR} {lines[NR]=$0} END {for(i=1;i<=last_import;i++) print lines[i]; print ""; print "def _bm_op_from_sta(sta: str) -> str:"; print "    \"\"\"从 SIM*_STA 取运营商显示，保留完整 '移动(46001)' 形式\"\"\""; print "    return (sta or \"\").strip()"; print ""; for(i=last_import+1;i<=NR;i++) print lines[i]}' "$MAIN" > "$MAIN.tmp" && mv "$MAIN.tmp" "$MAIN"
-fi
-
-# 1.3 追加 SIM1_STA/SIM2_STA 到请求列表
-if grep -q '"SIM2_OP"' "$MAIN" && ! grep -q '"SIM1_STA"' "$MAIN"; then
+    
+    # 添加/替换 _bm_op_from_sta 函数
+    if grep -q '^[[:space:]]*def[[:space:]]\+_bm_op_from_sta' "$MAIN"; then
+        # 替换现有函数
+        sed -i '/^[[:space:]]*def[[:space:]]\+_bm_op_from_sta/,/^[[:space:]]*def\|^[[:space:]]*class\|^[[:space:]]*@/{
+            /^[[:space:]]*def[[:space:]]\+_bm_op_from_sta/{
+                x
+                s/.*/def _bm_op_from_sta(sta: str) -> str:\
+    """从 SIM*_STA 取运营商显示，保留完整 '"'"'移动(46001)'"'"' 形式"""\
+    return (sta or "").strip()/
+                p
+                d
+            }
+            /^[[:space:]]*def\|^[[:space:]]*class\|^[[:space:]]*@/!d
+        }' "$MAIN"
+    else
+        # 在 import 后插入函数
+        awk '
+        /^[[:space:]]*(import|from)[[:space:]]/ { last_import = NR }
+        END {
+            if (last_import) {
+                cmd = "sed -i \"" last_import + 1 "i\\"
+                cmd = cmd "\\n"
+                cmd = cmd "def _bm_op_from_sta(sta: str) -> str:\\"
+                cmd = cmd "\\n    \\\"\\\"\\\"从 SIM*_STA 取运营商显示，保留完整 '\''移动(46001)'\'' 形式\\\"\\\"\\\"\\"
+                cmd = cmd "\\n    return (sta or \\\"\\\").strip()"
+                cmd = cmd "\\n\" '\""$MAIN"'\""
+                system(cmd)
+            }
+        }' "$MAIN"
+    fi
+    
+    # 添加 SIM1_STA/SIM2_STA 到 keys
     sed -i 's/"SIM2_OP"]/"SIM2_OP","SIM1_STA","SIM2_STA"]/g' "$MAIN"
     sed -i "s/'SIM2_OP']/'SIM2_OP','SIM1_STA','SIM2_STA']/g" "$MAIN"
+    
+    # 修改 sim1op 和 sim2op 的赋值逻辑
+    sed -i 's/sim1op = (data.get("SIM1_OP") or "").strip()/sim1op = ((data.get("SIM1_OP") or "").strip() or _bm_op_from_sta(data.get("SIM1_STA") or ""))/g' "$MAIN"
+    sed -i "s/sim1op = (data.get('SIM1_OP') or '').strip()/sim1op = ((data.get('SIM1_OP') or '').strip() or _bm_op_from_sta(data.get('SIM1_STA') or ''))/g" "$MAIN"
+    sed -i 's/sim2op = (data.get("SIM2_OP") or "").strip()/sim2op = ((data.get("SIM2_OP") or "").strip() or _bm_op_from_sta(data.get("SIM2_STA") or ""))/g' "$MAIN"
+    sed -i "s/sim2op = (data.get('SIM2_OP') or '').strip()/sim2op = ((data.get('SIM2_OP') or '').strip() or _bm_op_from_sta(data.get('SIM2_STA') or ''))/g" "$MAIN"
+    
+    echo "✅ 后端补丁完成：operator 将显示 '移动(460xx)'"
+}
+
+# 重启服务
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart board-manager-v4.service 2>/dev/null || true
+    systemctl restart board-manager-v6.service 2>/dev/null || true
 fi
 
-# 1.4 替换 sim1op/sim2op 逻辑（单行 sed，避免引号冲突）
-sed -i 's/sim1op = (data.get("SIM1_OP") or "").strip()/sim1op = ((data.get("SIM1_OP") or "").strip() or _bm_op_from_sta(data.get("SIM1_STA") or ""))/g' "$MAIN"
-sed -i "s/sim1op = (data.get('SIM1_OP') or '').strip()/sim1op = ((data.get('SIM1_OP') or '').strip() or _bm_op_from_sta(data.get('SIM1_STA') or ''))/g" "$MAIN"
-sed -i 's/sim2op = (data.get("SIM2_OP") or "").strip()/sim2op = ((data.get("SIM2_OP") or "").strip() or _bm_op_from_sta(data.get("SIM2_STA") or ""))/g' "$MAIN"
-sed -i "s/sim2op = (data.get('SIM2_OP') or '').strip()/sim2op = ((data.get('SIM2_OP') or '').strip() or _bm_op_from_sta(data.get('SIM2_STA') or ''))/g" "$MAIN"
-
-# 重启后端服务
-systemctl daemon-reload 2>/dev/null || true
-systemctl restart board-manager-v4.service 2>/dev/null || true
-systemctl restart board-manager-v6.service 2>/dev/null || true
-
-# ===================== 2. 前端补丁（App.vue）=====================
-echo -e "\n=== [2/3] 前端补丁：SIM 两行（上小下大，紧凑）==="
-check_file "$APPVUE" "App.vue"
-safe_replace "$APPVUE" "App.vue"
-
-# 2.1 替换旧 SIM 块（单行 awk，避免多行解析）
-NEW_SIM_BLOCK='<div v-if="d.sims?.sim1?.number || d.sims?.sim2?.number || d.sims?.sim1?.operator || d.sims?.sim2?.operator" class="device-sims">  <span v-if="d.sims?.sim1?.number || d.sims?.sim1?.operator" class="sim-badge bm-sim">    <span class="sim-title">SIM1: {{ d.sims?.sim1?.operator || '\''未知运营商'\'' }}</span>    <span class="sim-number mono">{{ d.sims?.sim1?.number || '\''-'\'' }}</span>  </span>  <span v-if="d.sims?.sim2?.number || d.sims?.sim2?.operator" class="sim-badge bm-sim">    <span class="sim-title">SIM2: {{ d.sims?.sim2?.operator || '\''未知运营商'\'' }}</span>    <span class="sim-number mono">{{ d.sims?.sim2?.number || '\''-'\'' }}</span>  </span></div>'
-if grep -q '<div v-if="d\.sims\?\.\s*sim1\?\.\s*number\s*\|\|\s*d\.sims\?\.\s*sim2\?\.\s*number"\s*class="device-sims">' "$APPVUE"; then
-    awk -v new="$NEW_SIM_BLOCK" '/<div v-if="d\.sims\?\.\s*sim1\?\.\s*number\s*\|\|\s*d\.sims\?\.\s*sim2\?\.\s*number"\s+class="device-sims">/ {print new; in_old=1; next} in_old && /<\/div>/ {in_old=0; next} !in_old {print}' "$APPVUE" > "$APPVUE.tmp" && mv "$APPVUE.tmp" "$APPVUE"
+echo ""
+echo "=== [2/3] 前端补丁：SIM 两行（上小下大，紧凑） ==="
+if [ ! -f "$APPVUE" ]; then
+    echo "⚠️  找不到 $APPVUE（这次安装可能没带前端源码）"
+    echo "跳过前端补丁..."
 else
-    if ! grep -q 'class="sim-badge bm-sim"' "$APPVUE"; then
-        echo "❌ 未找到旧结构，App.vue 可能已更新"
-        exit 1
+    # 备份前端文件
+    BACKUP_VUE="$APPVUE.bak.$(date +%Y%m%d_%H%M%S)"
+    cp -p "$APPVUE" "$BACKUP_VUE"
+    echo "✅ 已备份到: $BACKUP_VUE"
+    
+    # 使用 sed 修改 App.vue
+    TEMP_FILE=$(mktemp)
+    
+    # 读取文件内容
+    content=$(cat "$APPVUE")
+    
+    # 替换 SIM 显示块（简化版，适用于常见结构）
+    new_sim_block='<div v-if="d.sims?.sim1?.number || d.sims?.sim2?.number || d.sims?.sim1?.operator || d.sims?.sim2?.operator" class="device-sims">\
+  <span v-if="d.sims?.sim1?.number || d.sims?.sim1?.operator" class="sim-badge bm-sim">\
+    <span class="sim-title">SIM1: {{ d.sims?.sim1?.operator || '"'"'未知运营商'"'"' }}</span>\
+    <span class="sim-number mono">{{ d.sims?.sim1?.number || '"'"'-'"'"' }}</span>\
+  </span>\
+  <span v-if="d.sims?.sim2?.number || d.sims?.sim2?.operator" class="sim-badge bm-sim">\
+    <span class="sim-title">SIM2: {{ d.sims?.sim2?.operator || '"'"'未知运营商'"'"' }}</span>\
+    <span class="sim-number mono">{{ d.sims?.sim2?.number || '"'"'-'"'"' }}</span>\
+  </span>\
+</div>'
+    
+    # 尝试替换现有结构
+    echo "$content" | awk '
+    BEGIN { in_sim_div = 0; replaced = 0 }
+    /<div[[:space:]].*device-sims/ { in_sim_div = 1 }
+    in_sim_div && /<\/div>/ {
+        if (!replaced) {
+            print "'"$new_sim_block"'"
+            replaced = 1
+        }
+        in_sim_div = 0
+        next
+    }
+    in_sim_div { next }
+    { print }
+    ' > "$TEMP_FILE"
+    
+    # 检查是否替换成功
+    if grep -q 'class="device-sims"' "$TEMP_FILE"; then
+        mv "$TEMP_FILE" "$APPVUE"
+        
+        # 添加样式
+        if grep -q '<style>' "$APPVUE"; then
+            # 移除可能存在的旧样式
+            sed -i '/\/\* ===== BM_SIM_REINSTALL_STYLE ===== \*\//,/\/\* ===== END BM_SIM_REINSTALL_STYLE ===== \*\//d' "$APPVUE"
+            
+            # 添加新样式
+            css='/* ===== BM_SIM_REINSTALL_STYLE ===== */\
+.device-sims{ display:flex; gap:6px; flex-wrap:wrap; align-items:flex-start; }\
+.sim-badge.bm-sim{\
+  display:inline-flex;\
+  flex-direction:column;\
+  align-items:flex-start;\
+  gap:2px;\
+  padding:4px 8px;\
+  border:1px solid rgba(255,255,255,.12);\
+  border-radius:8px;\
+  background:rgba(255,255,255,.04);\
+}\
+.sim-badge.bm-sim .sim-title{\
+  font-size:10px;\
+  font-weight:600;\
+  opacity:.75;\
+  white-space:nowrap;\
+}\
+.sim-badge.bm-sim .sim-number{\
+  font-size:13px;\
+  font-weight:800;\
+  opacity:.95;\
+}\
+/* ===== END BM_SIM_REINSTALL_STYLE ===== */'
+            
+            sed -i "/<style>/a $css" "$APPVUE"
+        fi
+        
+        echo "✅ 前端补丁完成：两行紧凑显示"
+    else
+        echo "⚠️  前端结构可能已变化，使用手动补丁"
+        rm -f "$TEMP_FILE"
+        
+        # 创建手动补丁说明
+        echo ""
+        echo "=== 手动补丁说明 ==="
+        echo "请编辑 $APPVUE"
+        echo "1. 找到 device-sims 相关的 div 元素"
+        echo "2. 替换为以下内容:"
+        echo "$new_sim_block"
+        echo "3. 在 <style> 标签内添加以下 CSS:"
+        echo "$css"
     fi
 fi
 
-# 2.2 清理旧样式
-sed -i '/\/\* ===== BM_SIM_REINSTALL_STYLE ===== \*\//,/\/style>/d' "$APPVUE"
-
-# 2.3 注入 CSS（单行拼接，避免换行解析）
-CSS_BLOCK="/* ===== BM_SIM_REINSTALL_STYLE ===== */\n.device-sims{ display:flex; gap:6px; flex-wrap:wrap; align-items:flex-start; }\n.sim-badge.bm-sim{ display:inline-flex; flex-direction:column; align-items:flex-start; gap:2px; padding:4px 8px; border:1px solid rgba(255,255,255,.12); border-radius:8px; background:rgba(255,255,255,.04); }\n.sim-badge.bm-sim .sim-title{ font-size:10px; font-weight:600; opacity:.75; white-space:nowrap; }\n.sim-badge.bm-sim .sim-number{ font-size:13px; font-weight:800; opacity:.95; }"
-if grep -q "</style>" "$APPVUE"; then
-    sed -i "s|</style>|$CSS_BLOCK\n</style>|g" "$APPVUE"
+echo ""
+echo "=== [3/3] 构建前端 + 重启服务 ==="
+if [ -d "$FRONT" ] && [ -f "$FRONT/package.json" ]; then
+    echo "构建前端..."
+    cd "$FRONT"
+    
+    if [ ! -d "node_modules" ]; then
+        echo "安装 npm 依赖..."
+        npm install --silent
+    fi
+    
+    echo "运行构建..."
+    npm run build > /dev/null 2>&1 || {
+        echo "⚠️  构建过程可能有警告，继续执行..."
+    }
+    
+    echo "✅ 前端构建完成"
 else
-    echo -e "\n<style>\n$CSS_BLOCK\n</style>\n" >> "$APPVUE"
+    echo "⚠️  前端目录不存在，跳过构建"
 fi
 
-# ===================== 3. 构建前端 + 重启服务 =====================
-echo -e "\n=== [3/3] 构建前端 + 重启服务 ==="
-cd "$FRONT"
-
-# 安装依赖
-if [[ ! -d node_modules ]]; then
-    echo "安装前端依赖..."
-    npm install
+# 最后重启服务
+if command -v systemctl >/dev/null 2>&1; then
+    echo "重启服务..."
+    systemctl restart nginx 2>/dev/null || true
+    systemctl restart board-manager-v4.service 2>/dev/null || true
+    systemctl restart board-manager-v6.service 2>/dev/null || true
 fi
 
-# 构建前端
-echo "构建前端静态资源..."
-npm run build >/dev/null 2>&1 || { echo "❌ 前端构建失败"; exit 1; }
-
-# 重启服务
-systemctl restart nginx 2>/dev/null || true
-systemctl restart board-manager-v4.service 2>/dev/null || true
-systemctl restart board-manager-v6.service 2>/dev/null || true
-
-# ===================== 完成提示 =====================
-echo -e "\n✅ 补丁应用完成！"
-echo "👉 操作步骤："
-echo "  1. 网页点击「重新扫描/刷新状态」（拉取 SIM*_STA 数据）"
-echo "  2. 浏览器强制刷新（Ctrl+F5）清除缓存"
-echo "👉 备份文件位置：$BACKUP_DIR/"
+echo ""
+echo "✅ 补丁应用完成！"
+echo ""
+echo "下一步操作："
+echo "1. 打开网页，点击「重新扫描/刷新状态」按钮"
+echo "2. 浏览器强制刷新：Ctrl+F5（Windows/Linux）或 Cmd+Shift+R（Mac）"
+echo "3. 手机用户请清空缓存或使用无痕模式"
+echo ""
+echo "如果遇到问题："
+echo "• 查看备份文件: $BACKUP"
+if [ -f "$BACKUP_VUE" ]; then
+    echo "• 前端备份: $BACKUP_VUE"
+fi
+echo "• 查看服务状态: systemctl status board-manager-v4.service"
+echo "• 查看日志: journalctl -u board-manager-v4.service -f"
